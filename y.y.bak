@@ -1,0 +1,441 @@
+%{
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+extern char* get_current_line();
+extern void reset_line_buffer();
+
+extern int yylex();
+extern void yyerror(const char *s);
+extern int yylineno;
+int lineCount = 1, cntr = 0;
+
+typedef struct {
+   int errValue;
+} errorList;
+errorList list[40];
+
+// Symbol table structure
+typedef struct {
+    char *name;
+    int type; // 0=int, 1=float, 2=char, 3=string, -1=uninitialized
+    union {
+        int ival;
+        double fval;
+        char cval;
+        char *sval;
+    } value;
+    int initialized;
+} symbol;
+
+symbol symbol_table[100];
+int symbol_count = 0;
+
+int lookup_symbol(char *name);
+void add_symbol(char *name);
+void update_symbol_int(char *name, int val);
+void update_symbol_float(char *name, double val);
+void update_symbol_char(char *name, char val);
+void update_symbol_string(char *name, char *val);
+void print_symbol(char *name);
+int checkError(int errVal, int currentLine);
+double get_variable_numeric_value(char *name, int *error);
+%}
+
+%union {
+    int ival;
+    double fval;
+    char cval;
+    char *sval;
+    struct {
+        double fval;
+        int type; // 0=int, 1=float
+    } expr_val;
+}
+
+%token NEWLINE
+%token LET DISPLAY ASSIGN COMMA
+%token LPAREN RPAREN
+%token <ival> INT_VAL
+%token <fval> FLOAT_VAL
+%token <cval> CHAR_VAL
+%token <sval> STRING_VAL
+%token <sval> IDENTIFIER
+%token PLUS MINUS MULT DIV
+
+%left PLUS MINUS
+%left MULT DIV
+
+%type <expr_val> arithmetic_exp term factor
+%type <sval> concat_expr concat_item
+
+%%
+
+program:        line_list
+                ;
+
+line_list:      line_list line
+                | line
+                ;
+
+/* FIX 1: Strict Newline Handling */
+/* The statement logic is separated from the newline logic to prevent Shift/Reduce conflicts */
+line:           statement NEWLINE { 
+                  int x, result = 0;
+                  for(x = 1; x <= cntr; x++){
+                     result = checkError(list[x].errValue, lineCount);
+                     if(result > 0){ break; }
+                  }
+                  ++lineCount;
+                }
+                | error NEWLINE { yyerrok; ++lineCount; }
+                | NEWLINE { ++lineCount; }
+                ;
+
+statement:      var_decl
+                | assignment_stmt
+                | print_stmt
+                ;
+
+/* FIX 2: Removed id_list */
+/* assignment_list now handles both "let x" and "let x = 5" */
+var_decl:       LET assignment_list
+                ;
+
+assignment_list: decl_item
+                | assignment_list COMMA decl_item
+                ;
+
+decl_item:      IDENTIFIER ASSIGN CHAR_VAL
+                {
+                    add_symbol($1);
+                    update_symbol_char($1, $3);
+                    free($1);
+                }
+                | IDENTIFIER ASSIGN STRING_VAL
+                {
+                    add_symbol($1);
+                    update_symbol_string($1, $3);
+                    free($1);
+                    free($3);
+                }
+                /* FIX 3: Merged INT/FLOAT into arithmetic_exp */
+                /* This solves Reduce/Reduce conflicts by treating raw numbers as expressions */
+                | IDENTIFIER ASSIGN arithmetic_exp
+                {
+                    add_symbol($1);
+                    if ($3.type == 0 || ($3.fval == (int)$3.fval)) {
+                        update_symbol_int($1, (int)$3.fval);
+                    } else {
+                        update_symbol_float($1, $3.fval);
+                    }
+                    free($1);
+                }
+                | IDENTIFIER
+                {
+                    add_symbol($1);
+                    free($1);
+                }
+                ;
+
+assignment_stmt: assignment
+                | assignment_stmt COMMA assignment
+                ;
+
+assignment:     IDENTIFIER ASSIGN CHAR_VAL
+                {
+                    int idx = lookup_symbol($1);
+                    if (idx >= 0) {
+                        update_symbol_char($1, $3);
+                    } else {
+                        fprintf(stderr, "!! Error - Variable '%s' not declared\n", $1);
+                        fprintf(stderr, "~ ~ LINE %d: %s ~ ~\n", lineCount, get_current_line());
+                    }
+                    free($1);
+                }
+                | IDENTIFIER ASSIGN STRING_VAL
+                {
+                    int idx = lookup_symbol($1);
+                    if (idx >= 0) {
+                        update_symbol_string($1, $3);
+                    } else {
+                        fprintf(stderr, "!! Error - Variable '%s' not declared\n", $1);
+                        fprintf(stderr, "~ ~ LINE %d: %s ~ ~\n", lineCount, get_current_line());
+                    }
+                    free($1);
+                    free($3);
+                }
+                /* Unified numeric assignment */
+                | IDENTIFIER ASSIGN arithmetic_exp
+                {
+                    int idx = lookup_symbol($1);
+                    if (idx >= 0) {
+                        if ($3.type == 0 || ($3.fval == (int)$3.fval)) {
+                            update_symbol_int($1, (int)$3.fval);
+                        } else {
+                            update_symbol_float($1, $3.fval);
+                        }
+                    } else {
+                        fprintf(stderr, "!! Error - Variable '%s' not declared\n", $1);
+                        fprintf(stderr, "~ ~ LINE %d: %s ~ ~\n", lineCount, get_current_line());
+                    }
+                    free($1);
+                }
+                ;
+
+print_stmt:     DISPLAY STRING_VAL
+                {
+                    printf("%s\n", $2);
+                    free($2);
+                }
+                | DISPLAY IDENTIFIER
+                {
+                    print_symbol($2);
+                    free($2);
+                }
+                | DISPLAY concat_expr
+                {
+                    printf("%s\n", $2);
+                    free($2);
+                }
+                /* Added missing support for printing math directly */
+                | DISPLAY arithmetic_exp
+                {
+                     if ($2.type == 0 || ($2.fval == (int)$2.fval))
+                        printf("%d\n", (int)$2.fval);
+                     else
+                        printf("%.2f\n", $2.fval);
+                }
+                ;
+
+concat_expr:    concat_item PLUS concat_item
+                {
+                    char *result = malloc(strlen($1) + strlen($3) + 1);
+                    strcpy(result, $1);
+                    strcat(result, $3);
+                    $$ = result;
+                    free($1);
+                    free($3);
+                }
+                | concat_expr PLUS concat_item
+                {
+                    char *result = malloc(strlen($1) + strlen($3) + 1);
+                    strcpy(result, $1);
+                    strcat(result, $3);
+                    $$ = result;
+                    free($1);
+                    free($3);
+                }
+                ;
+
+concat_item:    STRING_VAL
+                {
+                    $$ = strdup($1);
+                    free($1);
+                }
+                | IDENTIFIER
+                {
+                    int idx = lookup_symbol($1);
+                    if (idx >= 0 && symbol_table[idx].initialized) {
+                        char buffer[1000];
+                        switch (symbol_table[idx].type) {
+                            case 0: sprintf(buffer, "%d", symbol_table[idx].value.ival); break;
+                            case 1: sprintf(buffer, "%.2f", symbol_table[idx].value.fval); break;
+                            case 2: sprintf(buffer, "%c", symbol_table[idx].value.cval); break;
+                            case 3: sprintf(buffer, "%s", symbol_table[idx].value.sval); break;
+                            default: sprintf(buffer, ""); break;
+                        }
+                        $$ = strdup(buffer);
+                    } else {
+                        fprintf(stderr, "LINE %d: Error - Variable '%s' not initialized or not declared\n", lineCount, $1);
+                        $$ = strdup("");
+                    }
+                    free($1);
+                }
+                ;
+
+arithmetic_exp: arithmetic_exp PLUS term 
+                { 
+                    $$.fval = $1.fval + $3.fval;
+                    $$.type = ($1.type == 1 || $3.type == 1) ? 1 : 0;
+                }
+                | arithmetic_exp MINUS term 
+                { 
+                    $$.fval = $1.fval - $3.fval;
+                    $$.type = ($1.type == 1 || $3.type == 1) ? 1 : 0;
+                }
+                | term { $$ = $1; }
+                ;
+
+term:           term MULT factor 
+                { 
+                    $$.fval = $1.fval * $3.fval;
+                    $$.type = ($1.type == 1 || $3.type == 1) ? 1 : 0;
+                }
+                | term DIV factor 
+                { 
+                    if ($3.fval == 0) {
+                        yyerror("Division by zero");
+                        $$.fval = 0;
+                        $$.type = 1;
+                    } else {
+                        $$.fval = $1.fval / $3.fval;
+                        $$.type = ($1.type == 1 || $3.type == 1) ? 1 : 0;
+                    }
+                }
+                | factor { $$ = $1; }
+                ;
+
+factor:         LPAREN arithmetic_exp RPAREN { $$ = $2; }
+                | INT_VAL 
+                { 
+                    $$.fval = (double)$1;
+                    $$.type = 0;
+                }
+                | FLOAT_VAL 
+                { 
+                    $$.fval = $1;
+                    $$.type = 1;
+                }
+                | IDENTIFIER
+                {
+                    int error = 0;
+                    $$.fval = get_variable_numeric_value($1, &error);
+                    if (error) {
+                        fprintf(stderr, "LINE %d: Error - Variable '%s' not initialized or not numeric\n", lineCount, $1);
+                        $$.fval = 0;
+                        $$.type = 0;
+                    } else {
+                        int idx = lookup_symbol($1);
+                        $$.type = symbol_table[idx].type; 
+                    }
+                    free($1);
+                }
+                ;
+
+%%
+
+int checkError(int errVal, int currentLine) {
+    if (errVal == currentLine) {
+        return 1;
+    }
+    return 0;
+}
+
+int lookup_symbol(char *name) {
+    for (int i = 0; i < symbol_count; i++) {
+        if (strcmp(symbol_table[i].name, name) == 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+void add_symbol(char *name) {
+    int idx = lookup_symbol(name);
+    if (idx >= 0) {
+        return;
+    }
+    
+    if (symbol_count >= 100) {
+        fprintf(stderr, "Symbol table full\n");
+        return;
+    }
+    symbol_table[symbol_count].name = strdup(name);
+    symbol_table[symbol_count].type = -1;
+    symbol_table[symbol_count].initialized = 0;
+    symbol_count++;
+}
+
+void update_symbol_int(char *name, int val) {
+    int idx = lookup_symbol(name);
+    if (idx >= 0) {
+        symbol_table[idx].value.ival = val;
+        symbol_table[idx].type = 0;
+        symbol_table[idx].initialized = 1;
+    }
+}
+
+void update_symbol_float(char *name, double val) {
+    int idx = lookup_symbol(name);
+    if (idx >= 0) {
+        symbol_table[idx].value.fval = val;
+        symbol_table[idx].type = 1;
+        symbol_table[idx].initialized = 1;
+    }
+}
+
+void update_symbol_char(char *name, char val) {
+    int idx = lookup_symbol(name);
+    if (idx >= 0) {
+        symbol_table[idx].value.cval = val;
+        symbol_table[idx].type = 2;
+        symbol_table[idx].initialized = 1;
+    }
+}
+
+void update_symbol_string(char *name, char *val) {
+    int idx = lookup_symbol(name);
+    if (idx >= 0) {
+        symbol_table[idx].value.sval = strdup(val);
+        symbol_table[idx].type = 3;
+        symbol_table[idx].initialized = 1;
+    }
+}
+
+void print_symbol(char *name) {
+    int idx = lookup_symbol(name);
+    if (idx < 0) {
+        printf("Error - Variable '%s' not declared\n", name);
+        return;
+    }
+    if (!symbol_table[idx].initialized) {
+        printf("Error - Variable '%s' not initialized\n", name);
+        return;
+    }
+    
+    switch (symbol_table[idx].type) {
+        case 0: printf("%d\n", symbol_table[idx].value.ival); break;
+        case 1: printf("%.2f\n", symbol_table[idx].value.fval); break;
+        case 2: printf("'%c'\n", symbol_table[idx].value.cval); break;
+        case 3: printf("%s\n", symbol_table[idx].value.sval); break;
+    }
+}
+
+double get_variable_numeric_value(char *name, int *error) {
+    int idx = lookup_symbol(name);
+    *error = 0;
+    if (idx < 0) {
+        *error = 1;
+        return 0.0;
+    }
+    
+    if (!symbol_table[idx].initialized) {
+        *error = 1;
+        return 0.0;
+    }
+    
+    switch (symbol_table[idx].type) {
+        case 0: return (double)symbol_table[idx].value.ival;
+        case 1: return symbol_table[idx].value.fval;
+        default:
+            *error = 1;
+            return 0.0;
+    }
+}
+
+int main(void) {
+    return yyparse();
+}
+
+void yyerror(const char *s) {
+    fflush(stdout);
+    list[++cntr].errValue = lineCount;
+    char *problem_line = get_current_line();
+    
+    fprintf(stderr, "\n");
+    fprintf(stderr, "!! Error (%s)\n", s);
+    fprintf(stderr, "~ ~ LINE %d: %s ~ ~\n",lineCount, problem_line);
+    fprintf(stderr, "\n");
+}
